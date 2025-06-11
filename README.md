@@ -9,6 +9,15 @@ A comprehensive step-by-step guide to self-host Chatwoot on Oracle Cloud VMs wit
 - SSH access to your Oracle Cloud VM
 - Basic command line knowledge
 
+## 🚨 ORACLE CLOUD FIREWALL CRITICAL INFO
+
+**Oracle Cloud has TWO firewall layers that BOTH need configuration:**
+
+1. **Cloud-Level:** Security Groups (Oracle Console)
+2. **Server-Level:** iptables (Ubuntu instance)
+
+**Why this matters:** Even with correct Security Groups, your server will block traffic due to Ubuntu's default iptables rules. This causes SSL certificate generation to fail.
+
 ## 🌐 Step 1: DNS Configuration
 
 **CRITICAL:** Set up your subdomain BEFORE starting the installation for SSL certificate generation.
@@ -17,25 +26,64 @@ Create an A record with your domain provider:
 
 | Record Type | Host | Value | TTL |
 |-------------|------|-------|-----|
-| A | chat | YOUR_VM_IP | 14400 |
+| A | sales | YOUR_VM_IP | 14400 |
 
-**Example:** If your domain is `example.com` and VM IP is `123.456.78.90`:
-- **Host:** `chat`
-- **Points to:** `123.456.78.90`  
-- **Result:** `chat.example.com` → `123.456.78.90`
+**Example:** If your domain is `stardawnai.com` and VM IP is `130.61.220.9`:
+- **Host:** `sales`
+- **Points to:** `130.61.220.9`  
+- **Result:** `sales.stardawnai.com` → `130.61.220.9`
 
 **Verify DNS propagation:**
 ```bash
-nslookup chat.example.com
+nslookup sales.stardawnai.com
+dig sales.stardawnai.com
 ```
 
-## 🔐 Step 2: Connect to Your VM
+## 🔐 Step 2: Oracle Cloud Security Groups
+
+In Oracle Console, configure these **Ingress Rules** for your VM's Security Group:
+
+| Protocol | Source | Port Range | Description |
+|----------|--------|------------|-------------|
+| TCP | 0.0.0.0/0 | 22 | SSH |
+| TCP | 0.0.0.0/0 | 80 | HTTP |
+| TCP | 0.0.0.0/0 | 443 | HTTPS |
+| TCP | 0.0.0.0/0 | 3000 | Chatwoot |
+| TCP | 0.0.0.0/0 | 5432 | PostgreSQL |
+| TCP | 0.0.0.0/0 | 6379 | Redis |
+
+## 🔐 Step 3: Connect to Your VM
 
 ```bash
 ssh -i ~/path/to/your-ssh-key.key ubuntu@YOUR_VM_IP
 ```
 
-## 📦 Step 3: Download and Run Chatwoot Installer
+## ⚡ Step 4: Fix Oracle Cloud iptables (CRITICAL)
+
+**Oracle Cloud blocks traffic despite Security Groups being correct. Fix this FIRST:**
+
+```bash
+# Check current iptables (you'll see REJECT rules blocking everything except SSH)
+sudo iptables -L INPUT -n -v
+
+# Add required ports BEFORE the REJECT rule
+sudo iptables -I INPUT 4 -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 5 -p tcp --dport 443 -j ACCEPT
+sudo iptables -I INPUT 6 -p tcp --dport 3000 -j ACCEPT
+sudo iptables -I INPUT 7 -p tcp --dport 5432 -j ACCEPT
+sudo iptables -I INPUT 8 -p tcp --dport 6379 -j ACCEPT
+
+# Make rules permanent
+sudo apt install iptables-persistent -y
+sudo iptables-save | sudo tee /etc/iptables/rules.v4
+
+# Verify ports are open
+sudo iptables -L INPUT -n
+```
+
+**Why this is needed:** Oracle Cloud Ubuntu instances come with restrictive iptables that block all traffic except SSH, regardless of Security Group settings.
+
+## 📦 Step 5: Download and Run Chatwoot Installer
 
 ```bash
 cd ~
@@ -44,13 +92,13 @@ chmod +x install.sh
 ./install.sh --install
 ```
 
-## ⚙️ Step 4: Installation Configuration
+## ⚙️ Step 6: Installation Configuration
 
 During installation, answer these prompts:
 
 - **Install Postgres and Redis?** → `yes`
 - **Domain setup?** → `y` (yes)
-- **Domain name?** → `chat.example.com` (your actual subdomain)
+- **Domain name?** → `sales.stardawnai.com` (your actual subdomain)
 - **Email for SSL?** → `your-email@example.com`
 - **Additional configurations** → Accept defaults
 
@@ -67,77 +115,41 @@ During installation, answer these prompts:
 ➥ 9/9 Setting up SSL/TLS.
 ```
 
-## 🛠️ Step 5: Manual SSL Setup (If Needed)
+## 🛠️ Step 7: Manual SSL Setup (If Needed)
 
-**Common error:**
-```
-Non-ASCII domain names not supported. To issue for an Internationalized Domain Name, use Punycode.
-Some error has occured. Check '/var/log/chatwoot-setup.log' for details.
-```
+**If SSL fails during installation, run manually:**
 
-**Solution - Manual SSL Certificate:**
 ```bash
-sudo certbot --nginx -d chat.example.com --email your-email@example.com --agree-tos --no-eff-email
-```
+# Generate SSL certificate
+sudo certbot certonly --standalone --agree-tos --email your-email@example.com -d sales.stardawnai.com
 
-**Alternative if above fails:**
-```bash
-sudo certbot certonly --standalone --agree-tos --email your-email@example.com -d chat.example.com
-```
+# Update existing nginx config with your domain
+sudo sed -i 's/chatwoot.domain.com/sales.stardawnai.com/g' ~/nginx_chatwoot.conf
 
-**Manual Nginx Configuration:**
-```bash
-sudo nano /etc/nginx/sites-available/chatwoot.conf
-```
+# Copy to nginx
+sudo cp ~/nginx_chatwoot.conf /etc/nginx/sites-enabled/chatwoot
 
-Add this configuration:
-```nginx
-server {
-    server_name chat.example.com;
-    
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 86400;
-    }
+# Remove default nginx config
+sudo rm -f /etc/nginx/sites-enabled/default
 
-    listen 443 ssl;
-    ssl_certificate /etc/letsencrypt/live/chat.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/chat.example.com/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-}
-
-server {
-    if ($host = chat.example.com) {
-        return 301 https://$host$request_uri;
-    }
-
-    listen 80;
-    server_name chat.example.com;
-    return 404;
-}
-```
-
-**Enable the configuration:**
-```bash
-sudo ln -s /etc/nginx/sites-available/chatwoot.conf /etc/nginx/sites-enabled/
+# Test and restart nginx
 sudo nginx -t
-sudo systemctl reload nginx
+sudo systemctl restart nginx
 ```
 
-## ✅ Step 6: Verify Installation
+## ✅ Step 8: Verify Installation
 
 **Check service status:**
 ```bash
+# Check Chatwoot services
 sudo systemctl status chatwoot.target
+sudo systemctl list-units | grep chatwoot
+
+# Check port binding
 sudo netstat -tlnp | grep :3000
+
+# Check nginx status
+sudo systemctl status nginx
 ```
 
 **View logs if needed:**
@@ -145,9 +157,9 @@ sudo netstat -tlnp | grep :3000
 journalctl -u chatwoot-web.1.service --lines=10 --no-pager
 ```
 
-## 🌍 Step 7: Access Your Chatwoot Instance
+## 🌍 Step 9: Access Your Chatwoot Instance
 
-Open your browser and navigate to: **https://chat.example.com**
+Open your browser and navigate to: **https://sales.stardawnai.com**
 
 You should see the Chatwoot welcome screen with account setup form.
 
@@ -159,7 +171,7 @@ You should see the Chatwoot welcome screen with account setup form.
 
 Click **"Finish Setup"** to complete the installation.
 
-## ⚙️ Step 8: Additional Configuration (Optional)
+## ⚙️ Step 10: Additional Configuration (Optional)
 
 Edit the environment file for additional configuration:
 ```bash
@@ -169,13 +181,13 @@ sudo -u chatwoot nano /home/chatwoot/chatwoot/.env
 Add these optional but recommended settings:
 ```bash
 # Frontend URL (REQUIRED)
-FRONTEND_URL=https://chat.example.com
+FRONTEND_URL=https://sales.stardawnai.com
 
 # Mailer Configuration (Recommended)
-MAILER_SENDER_EMAIL=noreply@example.com
+MAILER_SENDER_EMAIL=noreply@stardawnai.com
 SMTP_ADDRESS=smtp.gmail.com
 SMTP_PORT=587
-SMTP_DOMAIN=example.com
+SMTP_DOMAIN=stardawnai.com
 SMTP_USERNAME=your-email@gmail.com
 SMTP_PASSWORD=your-app-password
 SMTP_AUTHENTICATION=plain
@@ -190,7 +202,7 @@ ACTIVE_STORAGE_SERVICE=local
 sudo systemctl restart chatwoot.target
 ```
 
-## 🔄 Step 9: Auto-Start Configuration
+## 🔄 Step 11: Auto-Start Configuration
 
 Chatwoot should automatically start on boot. To verify:
 ```bash
@@ -210,6 +222,53 @@ Your setup uses these ports:
 - **Port 6379:** Redis (internal)  
 - **Port 80:** HTTP (redirects to HTTPS)
 - **Port 443:** HTTPS (SSL)
+
+## 🚨 Oracle Cloud Firewall Troubleshooting
+
+### Problem: SSL Certificate Generation Fails
+**Error:** `Error getting validation data` or `Connection refused`
+
+**Cause:** Oracle Cloud's double firewall blocking HTTP/HTTPS traffic
+
+**Solution:**
+```bash
+# 1. Verify DNS resolves to correct IP
+nslookup sales.stardawnai.com
+curl ifconfig.me
+
+# 2. Check Security Groups in Oracle Console (must allow ports 80, 443)
+
+# 3. Check local iptables
+sudo iptables -L INPUT -n -v
+
+# 4. If you see REJECT rules, add ports before them:
+sudo iptables -I INPUT 4 -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 5 -p tcp --dport 443 -j ACCEPT
+
+# 5. Test with simple HTTP server
+sudo python3 -m http.server 80
+
+# 6. Try SSL generation again
+sudo certbot certonly --standalone --agree-tos --email your-email@example.com -d sales.stardawnai.com
+```
+
+### Problem: 502 Bad Gateway
+**Cause:** Chatwoot service not running or port 3000 blocked
+
+**Solution:**
+```bash
+# Check if Chatwoot is running
+sudo netstat -tlnp | grep :3000
+sudo systemctl status chatwoot-web.1.service
+
+# If port 3000 blocked by iptables:
+sudo iptables -I INPUT 6 -p tcp --dport 3000 -j ACCEPT
+sudo iptables-save | sudo tee /etc/iptables/rules.v4
+
+# Restart services
+sudo systemctl restart chatwoot.target
+sudo systemctl restart nginx
+```
 
 ## 🛠️ Management Commands
 
@@ -241,21 +300,6 @@ sudo systemctl restart chatwoot.target
 # View logs
 journalctl -u chatwoot-web.1.service -f --lines=50
 journalctl -u chatwoot-worker.1.service -f --lines=50
-```
-
-### Database Operations
-```bash
-# Access Rails console
-sudo -u chatwoot -i
-cd chatwoot
-RAILS_ENV=production bundle exec rails c
-
-# Database migrations (after updates)
-sudo -u chatwoot -i
-cd chatwoot
-RAILS_ENV=production bundle exec rake db:migrate
-exit
-sudo systemctl restart chatwoot.target
 ```
 
 ## 🔄 Manual Updates
@@ -305,68 +349,7 @@ sudo systemctl restart chatwoot.target
 - Regularly update Chatwoot for security patches
 - Monitor logs for suspicious activity
 - Keep SSL certificates updated (auto-renewal should work)
-
-## 🛠️ Troubleshooting
-
-### 502 Bad Gateway
-**Cause:** Chatwoot service not running
-
-**Solution:**
-```bash
-# Check service status
-sudo systemctl status chatwoot-web.1.service
-
-# Check port binding
-sudo netstat -tlnp | grep :3000
-
-# Check logs
-journalctl -u chatwoot-web.1.service --lines=20 --no-pager
-
-# Restart services
-sudo systemctl restart chatwoot.target
-```
-
-### SSL Certificate Issues
-**Cause:** Domain not propagated or Certbot errors
-
-**Solution:**
-```bash
-# Test domain resolution
-nslookup chat.example.com
-
-# Manual certificate generation
-sudo certbot --nginx -d chat.example.com --email your-email@example.com
-
-# Check certificate status
-sudo certbot certificates
-```
-
-### Database Connection Issues
-**Cause:** PostgreSQL not running or configuration issues
-
-**Solution:**
-```bash
-# Check PostgreSQL status
-sudo systemctl status postgresql
-
-# Start PostgreSQL if needed
-sudo systemctl start postgresql
-
-# Check database exists
-sudo -u postgres psql -l | grep chatwoot
-```
-
-### Asset Compilation Issues
-**Cause:** JavaScript/CSS compilation errors
-
-**Solution:**
-```bash
-sudo -u chatwoot -i
-cd chatwoot
-RAILS_ENV=production rake assets:clean assets:clobber assets:precompile
-exit
-sudo systemctl restart chatwoot.target
-```
+- **Oracle Cloud specific:** Always configure both Security Groups AND iptables
 
 ## 📊 Monitoring & Logs
 
@@ -395,14 +378,17 @@ sudo netstat -tlnp
 
 # Check service status
 sudo systemctl list-units --type=service --state=running | grep chatwoot
+
+# Check iptables rules
+sudo iptables -L INPUT -n -v
 ```
 
 ## 🔌 API Access
 
 Once installed, your Chatwoot API will be available at:
-- **Base URL:** `https://chat.example.com/`
-- **API Endpoint:** `https://chat.example.com/api/v1/`
-- **Webhooks:** `https://chat.example.com/webhooks/`
+- **Base URL:** `https://sales.stardawnai.com/`
+- **API Endpoint:** `https://sales.stardawnai.com/api/v1/`
+- **Webhooks:** `https://sales.stardawnai.com/webhooks/`
 
 **Get your API credentials:**
 - Login to Chatwoot dashboard
@@ -415,9 +401,10 @@ You now have a fully functional, self-hosted Chatwoot instance that:
 
 - ✅ Runs 24/7 on Oracle Cloud free tier
 - ✅ Uses SSL encryption with automatic renewal
-- ✅ Accessible via custom domain
+- ✅ Accessible via custom domain (sales.stardawnai.com)
 - ✅ Auto-starts after VM reboots
 - ✅ Includes full database and Redis setup
+- ✅ Properly configured for Oracle Cloud's double firewall
 
 ### Next Steps:
 - Configure your first inbox (Website, Email, etc.)
@@ -425,5 +412,19 @@ You now have a fully functional, self-hosted Chatwoot instance that:
 - Customize chat widget appearance
 - Configure automation rules
 - Integrate with your website or app
+
+## ⚠️ Oracle Cloud Specific Notes
+
+**Why Oracle Cloud is different:**
+- **Double Firewall:** Security Groups + iptables both need configuration
+- **Restrictive Defaults:** Ubuntu instances block everything except SSH by default
+- **iptables Persistence:** Rules don't survive reboots without `iptables-persistent`
+
+**Other cloud providers (AWS, Google Cloud) typically:**
+- Have only one firewall layer
+- More permissive default configurations
+- Better documentation for web applications
+
+**This guide addresses Oracle Cloud's specific quirks that cause most installation failures.**
 
 **Need help?** Check the [official Chatwoot documentation](https://www.chatwoot.com/docs) or [community forum](https://github.com/chatwoot/chatwoot/discussions).
